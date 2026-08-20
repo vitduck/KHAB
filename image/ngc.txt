@@ -1,4 +1,0 @@
- # NGC images
- https://catalog.ngc.nvidia.com/orgs/nvidia/containers/hpc-benchmarks
- https://catalog.ngc.nvidia.com/orgs/hpc/containers/quantum_espresso
- https://catalog.ngc.nvidia.com/orgs/hpc/containers/gromacs
