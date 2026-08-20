@@ -416,31 +416,45 @@ throughput:
 latency:
   num_requests: 100
 ```
-Parameters: 
+Each parameter is scoped to how it drives the sharding, engine, or workload sweep, not a generic definition.
 
-| Parameter                 | Scalar/List    | Description                                                  |
-| ------------------------- | -------------- | ------------------------------------------------------------ |
-| `model`                   | scalar         | HF model id/path to benchmark. If `quant` isn't set, it is inferred from an `FP8`/`FP16`/`INT8`/`INT4` token in the model name, defaulting to `FP16` if none is found. |
-| `backend`                 | scalar         | Inference backend. `pytorch` builds at runtime with no `convert`/`build` step. `cpp` and `python` are legacy backends that need `convert`/`build` (`python` is throughput-only, see Backends). |
-| `outdir`                  | scalar         | Root directory for run outputs and reports.                  |
-| `sharding`                | list           | List of `{nnodes, pp, tp}` parallelism topologies to sweep (pipeline-parallel × tensor-parallel across nodes). `pp × tp` must divide evenly by `nnodes`; GPUs per node are derived as `(pp × tp) / nnodes`. |
-| `quant`                   | scalar         | Quantization tag (`FP16`/`FP8`/`INT8`/`INT4`), optional, see `model` above. |
-| `max_seq_len`             | scalar         | Max total sequence length (input + output tokens) the built engine supports. Not swept. |
-| `max_batch_sizes`         | scalar or list | Max batch size the engine is built/run for.                  |
-| `max_num_tokens`          | scalar or list | Max tokens processed per scheduler iteration.                |
-| `kv_cache_fraction`       | scalar         | Fraction of free GPU memory reserved for the KV cache, default `0.95`. |
-| `warmup`                  | scalar         | Number of warmup requests run before timing starts.          |
-| `workloads`               | list           | List of synthetic dataset specs (`input_mean`, `output_mean`, `num_requests`). |
-| `throughput.num_requests` | scalar         | Overrides the workload's request count for the throughput run. |
-| `throughput.concurrency`  | scalar or list | In-flight request cap for throughput. `auto`: unbounded concurrency, server is saturated. A list, e.g. `[16, 24, 32]`: limited concurrency sweep, one run per value. Unsupported on the `python` backend, see Backends. |
-| `latency.num_requests`    | scalar         | Overrides the workload's request count for the latency run (latency is always single-stream; there is no `concurrency` field). |
+| Parameter | Scalar/List | Description |
+|---|---|---|
+| `model` | scalar | HF model id/path to benchmark. If `quant` isn't set, it is inferred from an `FP8`/`FP16`/`INT8` token in the model name, defaulting to `FP16` if none is found. |
+| `backend` | scalar | Inference backend. `pytorch` builds at runtime with no `convert`/`build` step. `cpp` and `python` are legacy backends that need `convert`/`build` (`python` is throughput-only, see Backends). |
+| `outdir` | scalar | Root directory for run outputs and reports. |
+| `sharding` | list | List of `{nnodes, pp, tp}` parallelism topologies to sweep (pipeline-parallel × tensor-parallel across nodes). `pp × tp` must divide evenly by `nnodes`; GPUs per node are derived as `(pp × tp) / nnodes`. |
+| `quant` | scalar | Quantization tag (`FP16`/`FP8`/`INT8`), optional, see `model` above. |
+| `max_seq_len` | scalar | Max total sequence length (input + output tokens) the built engine supports. |
+| `max_batch_sizes` | scalar / list | Max batch size the engine is built/run for. |
+| `max_num_tokens` | scalar / list | Max tokens processed per scheduler iteration. |
+| `kv_cache_fraction` | scalar | Fraction of free GPU memory reserved for the KV cache, default `0.95`. |
+| `warmup` | scalar | Number of warmup requests run before timing starts. |
+| `workloads` | list | List of synthetic dataset specs (`input_mean`, `output_mean`, `num_requests`). |
+| `throughput.num_requests` | scalar | Overrides the workload's request count for the throughput run. |
+| `throughput.concurrency` | scalar / list | In-flight request cap for throughput. `auto`: unbounded concurrency, server is saturated. A list, e.g. `[16, 24, 32]`: limited concurrency sweep, one run per value. Unsupported on the `python` backend, see Backends. |
+| `latency.num_requests` | scalar | Overrides the workload's request count for the latency run (latency is always single-stream; there is no `concurrency` field). |
+
+#### Concurrency & Latency Tradeoff
+
+The `throughput.concurrency` sweep controls how many requests are in flight at once, which trades total GPU throughput against per-request latency (TTFT):
+
+- **Low concurrency**: each request arrives only after the previous one finishes. TTFT is prefill time only. There is no queuing but the GPU remains idles between requests.
+- **High concurrency**: a new request arrives before the prior one finishes. TTFT becomes prefill time *plus* queuing time, which grows with each additional in-flight request, while GPU utilization rises.
+- **`auto` (infinite request rate, the default)**: all requests are dispatched simultaneously. Queuing time dominates TTFT and GPU utilization peaks. Pass an explicit `concurrency` list to constrain this and measure the tradeoff at fixed levels instead.
+
+![Request concurrency and latency tradeoff: queuing vs. processing time under low, high, and infinite concurrency, plus real benchmark throughput/latency curves](assets/concurrency_full_infographic_v3.jpg)
+
+Benchmark data (Llama-3.1, `pytorch` backend) shows this concretely: as `concurrency` (`cc`) rises, TTFT grows sharply while per-GPU throughput increases and per-user output speed falls.
+
+| GPU config | Model | `cc=4` | `cc=8` | `cc=16` | `cc=32` | `cc=64` |
+|---|---|---|---|---|---|---|
+| 1×A100 | Llama-3.1-8B-Instruct | TTFT 55ms | TTFT 86ms | TTFT 141ms | TTFT 264ms | TTFT 526ms |
+| 8×A100 | Llama-3.1-70B-Instruct | TTFT 58ms | TTFT 62ms | TTFT 81ms | TTFT 114ms | TTFT 188ms |
+
+Choose lower `cc` values for latency-sensitive, single-user workloads; choose higher values to maximize aggregate serving throughput at the cost of per-user speed and TTFT.
 
 #### Running `run_llama3.py`
-
-Invoke the script with one or more pipeline steps and a `--config` YAML file.
-
-- Steps always execute in the fixed order: download, data, convert, build, throughput, latency
-- Order given on the command line does not matter; the script checks step membership sequentially, not by parsing an ordered list
 
 General form:
 ```bash
@@ -448,6 +462,8 @@ python run_llama3.py <step> [<step> ...] --config config.yaml
 ```
 
 Steps:
+
+- Steps always execute in the fixed order: download, data, convert, build, throughput, latency
 - `download`: pulls HF model weights into the container
 - `data`: generates the synthetic prompt dataset
 - `convert`, `build`: checkpoint conversion and TRT-LLM engine build (legacy `cpp`/`python` backends only; skip these for `backend: pytorch`, which builds at runtime)
@@ -461,4 +477,48 @@ python run_llama3.py download data throughput latency --config a100.yaml
 
 # legacy cpp backend (v100.yaml): full pipeline including engine build
 python run_llama3.py download data convert build throughput latency --config v100.yaml
+```
+
+#### Output 
+```
+[info]
+host  gpu35
+cpu   2 x AMD EPYC 7543 32-Core Processor
+gpu   8 x NVIDIA_A100-SXM4-80GB
+env   singularity/4.3.4
+
+[outputs]
+./output/20260508_10:35:21/LLAMA3-maintenance-throughput-n1-pp1-tp8-isl128-osl128-req10000-mtk8192-mbs2048.out.1
+./output/20260508_10:35:21/LLAMA3-maintenance-throughput-n2-pp1-tp16-isl128-osl128-req10000-mtk8192-mbs2048.out.1
+./output/20260508_10:35:21/LLAMA3-maintenance-throughput-n2-pp2-tp8-isl128-osl128-req10000-mtk8192-mbs2048.out.1
+./output/20260508_10:35:21/report.txt
+
+[result]
+
+  model              n   g   pp   tp   qnt    isl   osl     req    mnt    mbs   cc     #      tps   tps/u   spd/u   tps/g       ttft     itl   walltime (s)
+ -----------------------------------------------------------------------------------------------------------------------------------------------------------
+  meta-llama/Llam…   1   8    1    8   FP16   128   128   10000   8192   2048   auto   1   4531.3     0.9     2.5   566.4   124610.6   406.6          432.7
+  meta-llama/Llam…   2   8    1   16   FP16   128   128   10000   8192   2048   auto   1   4372.1     0.9     2.4   273.3   128741.4   421.6          452.4
+  meta-llama/Llam…   2   8    2    8   FP16   128   128   10000   8192   2048   auto   1   6960.8     1.0     2.4   435.1    76184.8   472.6          336.2
+
+
+[legend]
+key    value
+n      number of nodes
+g      number of GPUs per node
+qnt    quantization
+isl    input sequence length mean
+osl    output sequence length mean
+req    number of requests
+mnt    maximum number of tokens
+mbs    maximum batch size
+cc     concurrency
+tps    output token throughput
+tps/u  output token throughput per user
+spd/u  decode-only output speed per user
+tps/g  output token throughput per GPU
+ttft   average time to first token in ms
+itl    average inter-token latency in ms
+ttft   average time to first token in ms
+itl    average inter-token latency in ms
 ```
