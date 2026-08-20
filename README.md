@@ -285,3 +285,126 @@ cfg = VaspConfig(
 results = benchmark(cfg, repeats=1)
 report(results)
 ```
+### TensorRT-LLM Benchmark
+
+`LLamaConfig` drives TensorRT-LLM throughput and latency benchmarks for LLM models.
+
+#### Config Reference (`a100.yaml` / `v100.yaml`)
+
+Each YAML config has one required `config` block plus optional `throughput`/`latency` override blocks.
+
+**`v100.yaml`** 
+```
+config:
+  model: meta-llama/Llama-3.1-8B-Instruct
+  backend: cpp
+  outdir: ./output
+
+  sharding:
+    - {nnodes: 1, pp: 1, tp: 8}
+    
+  max_seq_len: 4096
+  max_batch_sizes: 2048
+  max_num_tokens: 65536
+  kv_cache_fraction: 0.90
+
+  warmup: 10
+
+  workloads:
+    - {input_mean: 128, output_mean: 128, num_requests: 30000}
+    - {input_mean: 128, output_mean: 2048, num_requests: 3000}
+    - {input_mean: 2048, output_mean: 128, num_requests: 3000}
+
+throughput:
+  num_requests: 1000
+  concurrency: 'auto'
+
+latency:
+  num_requests: 100
+```
+
+**`a100.yaml`**
+```
+config:
+  model: meta-llama/Llama-3.1-8B-Instruct
+  backend: pytorch
+  outdir: ./output
+
+  sharding:
+    - {nnodes: 1, pp: 1, tp: 1}
+    - {nnodes: 1, pp: 1, tp: 2}
+    - {nnodes: 2, pp: 1, tp: 16}
+    - {nnodes: 2, pp: 2, tp: 8}
+
+  max_seq_len: 4096
+  max_batch_sizes: 2048
+  max_num_tokens: 8192
+  kv_cache_fraction: 0.90
+
+  warmup: 10
+
+  workloads:
+    - {input_mean: 128, output_mean: 128, num_requests: 30000}
+    - {input_mean: 128, output_mean: 2048, num_requests: 3000}
+    - {input_mean: 2048, output_mean: 128, num_requests: 3000}
+
+throughput:
+  num_requests: 1000
+  concurrency: ['auto',16, 24, 32]
+
+latency:
+  num_requests: 100
+```
+Each parameter is scoped to how it drives the sharding, engine, or workload sweep, not a generic definition.
+
+- `model`: HF model id/path to benchmark. If `quant` isn't set, it is inferred from an `FP8`/`FP16`/`INT8`/`INT4` token in the model name, defaulting to `FP16` if none is found.
+- `backend`: inference backend. `pytorch` builds at runtime with no `convert`/`build` step. `cpp` and `python` are legacy backends that need `convert`/`build` (`python` is throughput-only, see Backends).
+- `outdir`: root directory for run outputs and reports
+- `sharding`: list of `{nnodes, pp, tp}` parallelism topologies to sweep (pipeline-parallel × tensor-parallel across nodes). `pp × tp` must divide evenly by `nnodes`; GPUs per node are derived as `(pp × tp) / nnodes`.
+- `quant`: quantization tag (`FP16`/`FP8`/`INT8`/`INT4`), optional, see `model` above
+- `max_seq_len`: max total sequence length (input + output tokens) the built engine supports, scalar only, not swept
+- `max_batch_sizes`: max batch size the engine is built/run for, scalar or list to sweep
+- `max_num_tokens`: max tokens processed per scheduler iteration, scalar or list to sweep
+- `kv_cache_fraction`: fraction of free GPU memory reserved for the KV cache, default `0.95`
+- `warmup`: number of warmup requests run before timing starts
+- `workloads`: list of synthetic dataset specs (`input_mean`, `output_mean`, `num_requests`)
+- `throughput.num_requests`: overrides the workload's request count for the throughput run
+- `throughput.concurrency`: in-flight request cap for throughput
+  - `auto`: unbounded concurrency, server is saturated
+  - a list, e.g. `[16, 24, 32]`: limited concurrency sweep, one run per value
+  - unsupported on the `python` backend, see Backends
+- `latency.num_requests`: overrides the workload's request count for the latency run (latency is always single-stream; there is no `concurrency` field)
+
+
+- `hf_dir()`: source HF checkpoint
+- `ckpt_dir()`: converted checkpoint
+- `engine_dir()`: built TensorRT-LLM engine
+- Sweep points with matching build-relevant parameters reuse the same checkpoint/engine
+
+#### Running `run_llama3.py`
+
+Invoke the script with one or more pipeline steps and a `--config` YAML file.
+
+- Steps always execute in the fixed order: download, data, convert, build, throughput, latency
+- Order given on the command line does not matter; the script checks step membership sequentially, not by parsing an ordered list
+
+General form:
+```bash
+python run_llama3.py <step> [<step> ...] --config <a100.yaml|v100.yaml>
+```
+
+Steps:
+- `download`: pulls HF model weights into the container
+- `data`: generates the synthetic prompt dataset
+- `convert`, `build`: checkpoint conversion and TRT-LLM engine build (legacy `cpp`/`python` backends only; skip these for `backend: pytorch`, which builds at runtime)
+- `throughput`: runs `LlamaThroughputConfig` sweep (respects `concurrency`)
+- `latency`: runs `LlamaLatencyConfig` sweep
+
+Examples:
+```bash
+# pytorch backend (a100.yaml): no convert/build needed
+python run_llama3.py download data throughput latency --config a100.yaml
+
+# legacy cpp backend (v100.yaml): full pipeline including engine build
+python run_llama3.py download data convert build throughput latency --config v100.yaml
+```
