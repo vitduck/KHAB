@@ -17,7 +17,7 @@ List of supported benchmark
 
 ## Architecture 
 ```
-khab/
+KHAB/
 ├── env.sh                     # PYTHONPATH modification
 ├── .gitignore
 ├── LICENSE
@@ -76,9 +76,11 @@ Compiler and array size choices play a crucial role in archive optimal bandwidth
 - Array size must be sufficiently large with respect to the CPU's L3 cache, e.g. 4x total cache size
 - GCC does not automatically emit non-temporal (write-through) store instructions, leading to understated bandwidth. 
    - On Intel CPUs, Intel (R) oneAPI compilers emit non-temporal stores by default. 
-   - On AMD CPUs, AMD Optimizing C/C++ and Fortran Compilers (AOCC) can also non-temporal stores 
+   - On AMD CPUs, AMD Optimizing C/C++ and Fortran Compilers (AOCC) can also emit non-temporal stores 
 
 ```python
+#!/usr/bin/env python
+
 from affinity import GNU
 
 from bmt import benchmark, report
@@ -107,8 +109,8 @@ report(results)
 
 It wraps [BabelStream](https://github.com/UoB-HPC/BabelStream), a STREAM-style benchmark reimplemented across many parallel programming models for cross-vendor comparison.
 - `device`: which device to run the test
-- `size`: array size in elements; larger arrays better saturate GPU memory bandwidth but need more device memory
-- `ntimes`: kernel repetitions; more repetitions reduce measurement noise at the cost of longer wall time
+- `size`: array size 
+- `ntimes`: number of repeated measurements
 
 BabelStream itself supports many backends (CUDA, HIP, SYCL, OpenMP, Kokkos, RAJA, TBB, Thrust).
 
@@ -117,6 +119,8 @@ BabelStream itself supports many backends (CUDA, HIP, SYCL, OpenMP, Kokkos, RAJA
 - Only the output parsing need to be changed to accommodate new backend 
 
 ```python
+#!/usr/bin/env python
+
 from affinity import GNU
 
 from bmt import benchmark, report
@@ -151,10 +155,10 @@ report(results)
 
 The two NVIDIA backends target different container generations and GPUs.
 
-| Backend | Container | Targets | Notable difference |
-|---|---|---|---|
-| `NvidiaLegacy` | NGC HPC-Benchmarks v21.04 | V100 | Always passes `--cpu-cores-per-rank` (from `nthreads`); requires `nthreads` to be set |
-| `Nvidia` | NGC HPC-Benchmarks v24.09 | A100, H100, H200, GH200 | No `--cpu-cores-per-rank` flag; auto-adds `--no-multinode` for single-node runs |
+| Backend | Version | Targets |
+|---|---|---|
+| `NvidiaLegacy` | nvcr.io/nvidia/hpc-benchmarks:21.4-hpl | Tesla V100 |
+| `Nvidia` | nvcr.io/nvidia/hpc-benchmarks:24.09 | Ampere, Hopper, Blackwell |
 
 Block size (NB) defaults are auto-selected per backend and, for `Nvidia`, per GPU generation.
 
@@ -169,6 +173,8 @@ Block size (NB) defaults are auto-selected per backend and, for `Nvidia`, per GP
 `blocksizes` stays sweepable; these are just the framework's starting point, override with an explicit value or list to tune further.
 
 ```python
+#!/usr/bin/env python
+
 from mpi import OpenMPI
 from hpl import HplConfig, HplLauncher, Nvidia, NvidiaLegacy
 from bmt import benchmark, report
@@ -221,6 +227,8 @@ Default batch size is auto-selected per detected GPU when `batch_sizes` is left 
 | other | 64 |
 
 ```python
+#!/usr/bin/env python
+
 from bmt import benchmark, report
 from env import module_purge, module_load, module_list
 from mpi import OpenMPI
@@ -259,6 +267,8 @@ report(results)
 - `nsims` (NSIM): bands optimized simultaneously in RMM-DIIS
 
 ```python
+#!/usr/bin/env python
+
 from bmt import benchmark, report
 from mpi import OpenMPI
 from vasp import VaspConfig, VaspLauncher
@@ -285,9 +295,56 @@ cfg = VaspConfig(
 results = benchmark(cfg, repeats=1)
 report(results)
 ```
-### TensorRT-LLM Benchmark
+### TensorRT-LLM
 
 `LLamaConfig` drives TensorRT-LLM throughput and latency benchmarks for LLM models.
+
+#### Legacy vs. PyTorch Backend
+
+TensorRT-LLM's benchmark pipeline differs fundamentally depending on GPU generation. 
+- The legacy backend requires building a static compiled targeting a fixed TP/PP topology and quantization scheme.
+- The modern `pytorch` backend instead builds and optimizes the model graph at runtime, deferring those decisions to execution time.
+
+![Legacy (cpp/V100) vs PyTorch (A100+) TensorRT-LLM benchmark workflow](assets/workflow.png)
+
+On the nature of `convert` and `build` steps for legacy backend: 
+- **`convert`**:  transforms the downloaded HuggingFace checkpoint into TensorRT-LLM's internal checkpoint format
+  - Shard weights per the configured TP/PP topology
+  - Apply requested quantization (INT4/INT8/FP8).
+  - Produce one file **per rank**: one weights file per GPU, each holding only that rank's shard of the model
+- **`build`**: compiles each rank's checkpoint shard into its own serialized TensorRT engine, optimized for the target GPU.
+  - Produce one engine file per rank, matching the per-rank checkpoints from `convert`. 
+
+This split traces directly to TensorRT-LLM's GPU support lifecycle where `v0.14.0` was the last version that official support V100. 
+
+| Version | Date | Backend-relevant change |
+|---|---|---|
+| v0.14.0 | 2024/11 | Volta GPU support deprecated (warning of future removal) |
+| v0.15.0 | 2024/12 | Volta GPU support removed (breaking) |
+| v0.16.0 | 2024/12 | Initial support for GH200 |
+| v0.17.0 | 2025/02 | PyTorch workflow introduced as *experimental* (H100/H200/B200 only) |
+| v0.19.0 | 2025/03 | C++ runtime open-sourced |
+| v1.0.0  | 2025/09 | PyTorch becomes the *default* backend |
+| v1.2.0  | 2026/03 | NUMA-aware CPU affinity auto-config added |
+
+**Officially validated models (as of v1.2.0):**
+
+The following models have been verified by NVIDIA
+
+| Model | Precision |
+|---|---|
+| GPT-OSS-20B, GPT-OSS-120B | MXFP4 |
+| Llama-3.1-8B-Instruct | FP16 / FP8 / NVFP4 |
+| Llama-3.3-70B-Instruct | FP8 / NVFP4 |
+| Qwen3-8B, Qwen3-14B | FP16 / FP8 / NVFP4 |
+| Qwen3-32B | FP16 / NVFP4 |
+| Qwen3-30B-A3B | FP16 / NVFP4 |
+| NVIDIA-Nemotron-Nano-9B-v2 | FP4 |
+| Llama-3.3-Nemotron-Super-49B-v1.5 | FP8 |
+| Phi-4-multimodal-instruct | FP16 / FP8 / NVFP4 |
+| Phi-4-reasoning-plus | FP16 / FP8 / NVFP4 |
+
+*Beta support (not yet validated): K-EXAONE, Nemotron Nano V3, Qwen3-Next, Qwen3-VL.*
 
 #### Config Reference (`a100.yaml` / `v100.yaml`)
 
@@ -323,6 +380,10 @@ latency:
   num_requests: 100
 ```
 
+- Limitations of legacy backend:
+  - Lack of multi-node support
+  - Lack of concurency mode, e.g. `auto` only 
+
 **`a100.yaml`**
 ```
 config:
@@ -355,31 +416,24 @@ throughput:
 latency:
   num_requests: 100
 ```
-Each parameter is scoped to how it drives the sharding, engine, or workload sweep, not a generic definition.
+Parameters: 
 
-- `model`: HF model id/path to benchmark. If `quant` isn't set, it is inferred from an `FP8`/`FP16`/`INT8`/`INT4` token in the model name, defaulting to `FP16` if none is found.
-- `backend`: inference backend. `pytorch` builds at runtime with no `convert`/`build` step. `cpp` and `python` are legacy backends that need `convert`/`build` (`python` is throughput-only, see Backends).
-- `outdir`: root directory for run outputs and reports
-- `sharding`: list of `{nnodes, pp, tp}` parallelism topologies to sweep (pipeline-parallel × tensor-parallel across nodes). `pp × tp` must divide evenly by `nnodes`; GPUs per node are derived as `(pp × tp) / nnodes`.
-- `quant`: quantization tag (`FP16`/`FP8`/`INT8`/`INT4`), optional, see `model` above
-- `max_seq_len`: max total sequence length (input + output tokens) the built engine supports, scalar only, not swept
-- `max_batch_sizes`: max batch size the engine is built/run for, scalar or list to sweep
-- `max_num_tokens`: max tokens processed per scheduler iteration, scalar or list to sweep
-- `kv_cache_fraction`: fraction of free GPU memory reserved for the KV cache, default `0.95`
-- `warmup`: number of warmup requests run before timing starts
-- `workloads`: list of synthetic dataset specs (`input_mean`, `output_mean`, `num_requests`)
-- `throughput.num_requests`: overrides the workload's request count for the throughput run
-- `throughput.concurrency`: in-flight request cap for throughput
-  - `auto`: unbounded concurrency, server is saturated
-  - a list, e.g. `[16, 24, 32]`: limited concurrency sweep, one run per value
-  - unsupported on the `python` backend, see Backends
-- `latency.num_requests`: overrides the workload's request count for the latency run (latency is always single-stream; there is no `concurrency` field)
-
-
-- `hf_dir()`: source HF checkpoint
-- `ckpt_dir()`: converted checkpoint
-- `engine_dir()`: built TensorRT-LLM engine
-- Sweep points with matching build-relevant parameters reuse the same checkpoint/engine
+| Parameter                 | Scalar/List    | Description                                                  |
+| ------------------------- | -------------- | ------------------------------------------------------------ |
+| `model`                   | scalar         | HF model id/path to benchmark. If `quant` isn't set, it is inferred from an `FP8`/`FP16`/`INT8`/`INT4` token in the model name, defaulting to `FP16` if none is found. |
+| `backend`                 | scalar         | Inference backend. `pytorch` builds at runtime with no `convert`/`build` step. `cpp` and `python` are legacy backends that need `convert`/`build` (`python` is throughput-only, see Backends). |
+| `outdir`                  | scalar         | Root directory for run outputs and reports.                  |
+| `sharding`                | list           | List of `{nnodes, pp, tp}` parallelism topologies to sweep (pipeline-parallel × tensor-parallel across nodes). `pp × tp` must divide evenly by `nnodes`; GPUs per node are derived as `(pp × tp) / nnodes`. |
+| `quant`                   | scalar         | Quantization tag (`FP16`/`FP8`/`INT8`/`INT4`), optional, see `model` above. |
+| `max_seq_len`             | scalar         | Max total sequence length (input + output tokens) the built engine supports. Not swept. |
+| `max_batch_sizes`         | scalar or list | Max batch size the engine is built/run for.                  |
+| `max_num_tokens`          | scalar or list | Max tokens processed per scheduler iteration.                |
+| `kv_cache_fraction`       | scalar         | Fraction of free GPU memory reserved for the KV cache, default `0.95`. |
+| `warmup`                  | scalar         | Number of warmup requests run before timing starts.          |
+| `workloads`               | list           | List of synthetic dataset specs (`input_mean`, `output_mean`, `num_requests`). |
+| `throughput.num_requests` | scalar         | Overrides the workload's request count for the throughput run. |
+| `throughput.concurrency`  | scalar or list | In-flight request cap for throughput. `auto`: unbounded concurrency, server is saturated. A list, e.g. `[16, 24, 32]`: limited concurrency sweep, one run per value. Unsupported on the `python` backend, see Backends. |
+| `latency.num_requests`    | scalar         | Overrides the workload's request count for the latency run (latency is always single-stream; there is no `concurrency` field). |
 
 #### Running `run_llama3.py`
 
@@ -390,7 +444,7 @@ Invoke the script with one or more pipeline steps and a `--config` YAML file.
 
 General form:
 ```bash
-python run_llama3.py <step> [<step> ...] --config <a100.yaml|v100.yaml>
+python run_llama3.py <step> [<step> ...] --config config.yaml
 ```
 
 Steps:
