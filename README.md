@@ -302,8 +302,8 @@ report(results)
 #### Legacy vs. PyTorch Backend
 
 TensorRT-LLM's benchmark pipeline differs fundamentally depending on GPU generation. 
-- The legacy backend requires building a static compiled targeting a fixed TP/PP topology and quantization scheme.
-- The modern `pytorch` backend instead builds and optimizes the model graph at runtime, deferring those decisions to execution time.
+- The legacy backend requires building a static compiled TensorRT engline targeting a fixed TP/PP topology and quantization scheme.
+- The modern `pytorch` backend instead builds and optimizes the model graph at runtime
 
 ![Legacy (cpp/V100) vs PyTorch (A100+) TensorRT-LLM benchmark workflow](assets/workflow.png)
 
@@ -416,7 +416,13 @@ throughput:
 latency:
   num_requests: 100
 ```
-Each parameter is scoped to how it drives the sharding, engine, or workload sweep, not a generic definition.
+In the above config, we consider three common inference scenarios with different characteristic. 
+- These are synthetic data genearated through TensorRT-LLM's internal utility
+- The number of requests to be used in `throughput`/`latency` workflow can be individually overriden
+  - For `throughput`, a typically high number of request is desirable to saturate GPU pipeline
+  - For `latency`, there is no concurency and one can obtain converge result with much less requests
+ 
+![input](assets/param.png)
 
 | Parameter | Scalar/List | Description |
 |---|---|---|
@@ -434,6 +440,22 @@ Each parameter is scoped to how it drives the sharding, engine, or workload swee
 | `throughput.num_requests` | scalar | Overrides the workload's request count for the throughput run. |
 | `throughput.concurrency` | scalar / list | In-flight request cap for throughput. `auto`: unbounded concurrency, server is saturated. A list, e.g. `[16, 24, 32]`: limited concurrency sweep, one run per value. Unsupported on the `python` backend, see Backends. |
 | `latency.num_requests` | scalar | Overrides the workload's request count for the latency run (latency is always single-stream; there is no `concurrency` field). |
+
+#### Sharding strategy
+![sharding](assets/tensor_and_pipeline_parallelism_v5.jpg)
+
+- Tensor parallelism (TP):
+  - Splits each layer's weights across GPUs
+  - All GPUs process the same layer simultaneously
+  - Before moving to the next layer, all GPUs sum their partial results via All-Reduce
+
+- Pipeline parallelism (PP):
+  - Divides the model's layers into consecutive groups and assigns them to GPUs in order
+  - Each GPU must wait until the previous layer's computation is finished
+
+- Due to the discrepancy of performance of NCCL_Allreduce between inter-node (Infiniband) and intra-node (NVLINK) 
+  - For single-node DGX inference: nnodes=1, tp=8, pp=1 offers best performance
+  - For multi-node DGX inference: nnodes=2, tp=8, pp=2 offers best performance, e.g tensor within node and pipeline across node    
 
 #### Concurrency & Latency Tradeoff
 
@@ -479,6 +501,37 @@ python run_llama3.py download data throughput latency --config a100.yaml
 python run_llama3.py download data convert build throughput latency --config v100.yaml
 ```
 
+#### Log 
+```
+[command]
+srun \
+    --nodes 1 \
+    --ntasks 1 \
+    --ntasks-per-node 1 \
+    --cpus-per-task 64 \
+    singularity \
+        run \
+        --nv \
+        ../00-sif/tensorrt_llm_v1.2.0_x86.sif \
+        trtllm-llmapi-launch \
+            trtllm-bench \
+                --model meta-llama/Llama-3.1-8B-Instruct \
+                --model_path hf-models/meta-llama/Llama-3.1-8B-Instruct \
+                throughput \
+                --tp 1 \
+                --pp 1 \
+                --kv_cache_free_gpu_mem_fraction 0.9 \
+                --max_batch_size 2048 \
+                --max_num_tokens 8192 \
+                --dataset datasets/synthetic-isl128-osl128-req30000.txt \
+                --backend pytorch \
+                --warmup 10 \
+                --num_requests 1000 \
+                --streaming \
+                --concurrency 64
+```
+- Log show full command used in the benchmark
+  
 #### Output 
 ```
 [info]
@@ -522,3 +575,4 @@ itl    average inter-token latency in ms
 ttft   average time to first token in ms
 itl    average inter-token latency in ms
 ```
+- Raw output file are saved in directories with timestamps.  
