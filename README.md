@@ -50,6 +50,15 @@ KHAB/
         ├── a100.yaml
         └── v100.yaml
 ```
+
+## Obtain the source code 
+```
+git clone https://github.com/vitduck/KHAB.git
+
+cd KHAB
+source env.sh 
+```
+
 ## Environmental setup 
 ```
 conda create -n khab python=3.12
@@ -302,8 +311,10 @@ report(results)
 #### Legacy vs. PyTorch Backend
 
 TensorRT-LLM's benchmark pipeline differs fundamentally depending on GPU generation. 
-- The legacy backend requires building a static compiled TensorRT engline targeting a fixed TP/PP topology and quantization scheme.
+- The legacy backend requires building a static compiled TensorRT engline targeting a fixed TP/PP topology and quantization scheme
+  - A singularity def file is provided: tensorrt_llm_v0.14.0.def
 - The modern `pytorch` backend instead builds and optimizes the model graph at runtime
+  - Official container published by NVIDIA: nvcr.io/nvidia/tensorrt-llm/release:1.2.1
 
 ![Legacy (cpp/V100) vs PyTorch (A100+) TensorRT-LLM benchmark workflow](assets/workflow.png)
 
